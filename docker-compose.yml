@@ -1,0 +1,11 @@
+version: "3"
+services:
+  # Init replica set with
+  # rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})
+  database:
+    image: mongo:4.2
+    ports:
+    - 27017:27017
+    volumes:
+    - ./db_data/:/data/db
+    command: --replSet "rs0"

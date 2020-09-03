@@ -1,0 +1,31 @@
+server:
+  tls:
+    certificate: tls/tls.crt
+    key: tls/tls.key
+    cipherSuites:
+      - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+      - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+    minVersion: "1.2"
+    serverCipherSuiteOrder: true
+  imap:
+    address: :1143
+    allowInsecureAuth: false
+  imaps:
+    address: :1993
+
+ldap:
+  hostname: ""
+  port: 636
+  username: ""
+  password: ""
+  baseDN: ""
+  scope: 1
+  userFilter: "(objectClass=inetOrgPerson)"
+  usernameAttribute: uid
+  mailAttribute: mail
+mongodb:
+  uri: mongodb://localhost:27017/mail?w=majority
