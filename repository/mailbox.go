@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
 	"github.com/patrick246/imap/backend/mongodb/constants"
@@ -10,7 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"time"
+	"math/rand"
 )
 
 const mailboxCollection string = "mailboxes"
@@ -64,13 +65,11 @@ func (repo *MailboxRepository) CreateMailbox(name, owner string, access map[stri
 		permissions[username] = permission
 	}
 
-	uidValidity := uint32(time.Now().Unix())
+	uidValidity := rand.Uint32()
 	doc := bson.M{
-		"name":        name,
-		"newMessages": false,
-		"nextUid":     1,
-		// We're using the time as unix seconds as a pseudo unique value for a single mailbox
-		// This still works when Y2K38 hits
+		"name":         name,
+		"newMessages":  false,
+		"nextUid":      1,
 		"uidValidity":  uidValidity,
 		"permissions":  permissions,
 		"subscribedBy": bson.A{},
@@ -127,14 +126,14 @@ func (repo *MailboxRepository) FindUserMailboxes(username string, subscribed boo
 
 func (repo *MailboxRepository) DeleteMailbox(name, owner string) error {
 
-	hasChildren, err := repo.hasChildren(name, owner)
+	children, err := repo.FindChildren(name, owner)
 	if err != nil {
 		return err
 	}
 
 	// ToDo: Remove mailbox contents
 
-	if !hasChildren {
+	if len(children) == 0 {
 		query := bson.D{{
 			"name", name,
 		}, {
@@ -229,6 +228,29 @@ func (repo *MailboxRepository) AllocateUid(name, owner string) (uint32, error) {
 	return mailbox.NextUid, err
 }
 
+func (repo *MailboxRepository) AllocateUidById(mailboxId string) (uint32, error) {
+	mailboxQuery := bson.D{{
+		"_id", mailboxId,
+	}}
+
+	update := bson.D{{
+		"$inc", bson.D{{
+			"nextUid", 1,
+		}},
+	}}
+
+	projection := bson.D{{
+		"nextUid", 1,
+	}}
+
+	updateOptions := options.FindOneAndUpdate().SetReturnDocument(options.Before).SetProjection(projection)
+	result := repo.conn.Collection(mailboxCollection).FindOneAndUpdate(context.Background(), mailboxQuery, update, updateOptions)
+
+	var mailbox Mailbox
+	err := result.Decode(&mailbox)
+	return mailbox.NextUid, err
+}
+
 func (i *MailboxRepository) FindMailboxFlags(id string) (map[string]struct{}, error) {
 	query := bson.D{{
 		"_id", bson.D{{
@@ -292,12 +314,41 @@ func (i *MailboxRepository) FindFirstUnseenMessageUid(mailboxId string) (uint32,
 	return message.Uid, nil
 }
 
+func (repo *MailboxRepository) ChangeMailboxName(id, newName string) error {
+	oid, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		return err
+	}
+
+	query := bson.D{{
+		"_id", oid,
+	}}
+
+	update := bson.D{{
+		"$set", bson.D{{
+			"name", newName,
+		}, {
+			"uidValidity", rand.Uint32(),
+		}},
+	}}
+
+	result, err := repo.conn.Collection(mailboxCollection).UpdateOne(context.Background(), query, update)
+	if err != nil {
+		return err
+	}
+
+	if result.ModifiedCount != 1 {
+		return errors.New("no mailbox modified")
+	}
+	return nil
+}
+
 /*
 	Determines if the mailbox has any children, this causes different behavior when renaming or deleting
 
 	if an error is returned, the boolean return value can NOT be used
 */
-func (repo *MailboxRepository) hasChildren(name, owner string) (bool, error) {
+func (repo *MailboxRepository) FindChildren(name, owner string) ([]Mailbox, error) {
 	query := bson.D{{
 		"name", bson.D{{
 			"$gte", name + constants.MailboxPathSeparator,
@@ -308,10 +359,20 @@ func (repo *MailboxRepository) hasChildren(name, owner string) (bool, error) {
 		"owner", owner,
 	}}
 
-	count, err := repo.conn.Collection(mailboxCollection).CountDocuments(context.Background(), query)
+	cursor, err := repo.conn.Collection(mailboxCollection).Find(context.Background(), query)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
-	return count > 0, nil
+	var mailboxes []Mailbox
+	for cursor.Next(context.Background()) {
+		var document Mailbox
+		err = cursor.Decode(&document)
+		if err != nil {
+			return nil, err
+		}
+		mailboxes = append(mailboxes, document)
+	}
+
+	return mailboxes, nil
 }

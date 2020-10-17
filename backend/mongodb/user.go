@@ -85,7 +85,10 @@ func (i *ImapUser) SetSubscribed(mbox string, subscribed bool) error {
 	return i.mailboxRepo.SetSubscriptionByUser(name, owner, i.Username(), subscribed)
 }
 
-func (i *ImapUser) CreateMessage(mbox string, flags []string, date time.Time, body imap.Literal) error {
+func (i *ImapUser) CreateMessage(mbox string, flags []string, date time.Time, body imap.Literal, selectedMailbox backend.Mailbox) error {
+	log.Debugw("begin createmessage", "mailbox", mbox)
+	defer log.Debugw("end createmessage", "mailbox", mbox)
+
 	name, owner, err := i.findNameAndOwner(mbox)
 	if err != nil {
 		return err
@@ -136,8 +139,19 @@ func (i *ImapUser) CreateMessage(mbox string, flags []string, date time.Time, bo
 	// Read the remaining bytes, so everything gets written to GridFS
 	_, err = io.Copy(ioutil.Discard, teeReader)
 
-	time.Sleep(10 * time.Millisecond)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if selectedMailbox != nil {
+		mongodbMailbox, ok := selectedMailbox.(*ImapMailbox)
+		if ok && mongodbMailbox.id == mailbox.Id {
+			mongodbMailbox.handleMailboxUpdateWithExpunge(0, 1)
+		}
+	}
+
+	//time.Sleep(100 * time.Millisecond)
+	return nil
 }
 
 func (i *ImapUser) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
@@ -300,7 +314,82 @@ func (i *ImapUser) DeleteMailbox(name string) error {
 }
 
 func (i *ImapUser) RenameMailbox(existingName, newName string) error {
-	return errors.New("not implemented: User.RenameMailbox")
+	log.Debugw("begin rename mailbox", "old", existingName, "new", newName)
+	defer log.Debugw("end rename mailbox", "old", existingName, "new", newName)
+
+	if strings.EqualFold(existingName, "INBOX") {
+		return errors.New("not implemented: User.RenameMailbox of INBOX")
+	}
+
+	if strings.HasPrefix(existingName, namespaceOtherPrefix+constants.MailboxPathSeparator) {
+		log.Warnw("rename mailbox in "+namespaceOtherPrefix, "username", i.userInfo.Username, "mailboxName", existingName)
+		return errors.New("can't rename mailboxes of other users")
+	}
+
+	existingMailboxName, existingMailboxOwner, err := i.findNameAndOwner(existingName)
+	if err != nil {
+		return err
+	}
+
+	existingMailbox, err := i.mailboxRepo.FindByNameAndOwner(existingMailboxName, existingMailboxOwner)
+	if err != nil {
+		return err
+	}
+
+	newMailboxName, newMailboxOwner, err := i.findNameAndOwner(newName)
+	if err != nil {
+		return err
+	}
+
+	if existingMailboxOwner != newMailboxOwner {
+		return errors.New("can't rename mailbox between namespaces")
+	}
+
+	newParts := strings.Split(newMailboxName, constants.MailboxPathSeparator)
+
+	// Create parents if necessary
+	parent := ""
+	for index, part := range newParts {
+		if index >= len(newParts)-1 {
+			break
+		}
+		_, err := i.mailboxRepo.CreateMailbox(parent+part, newMailboxOwner, map[string]repository.Permission{
+			i.Username(): repository.READWRITE,
+		})
+
+		parent = parent + part + constants.MailboxPathSeparator
+
+		if writeErr, ok := err.(mongo.WriteException); ok && writeErr.WriteErrors[0].Code == 11000 {
+			// Ignore "duplicate key" errors for parent mailboxes, as they can already exist
+			continue
+		}
+		if err != nil {
+			log.Errorw("mailbox rename, parent create error",
+				"name", parent+part,
+				"username", i.userInfo.Username,
+				"owner", newMailboxOwner,
+				"error", err,
+			)
+			return err
+		}
+	}
+
+	// Rename children
+	children, err := i.mailboxRepo.FindChildren(existingMailboxName, existingMailboxOwner)
+	if err != nil {
+		return err
+	}
+
+	for _, child := range children {
+		newName := strings.Replace(child.Name, existingMailboxName, newMailboxName, 1)
+		err = i.mailboxRepo.ChangeMailboxName(child.Id, newName)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = i.mailboxRepo.ChangeMailboxName(existingMailbox.Id, newMailboxName)
+	return nil
 }
 
 func (i *ImapUser) Logout() error {
@@ -335,6 +424,24 @@ func (i *ImapUser) findNameAndOwner(name string) (mailboxName, owner string, err
 		mailboxName = parts[2]
 	} else {
 		owner = i.Username()
+		mailboxName = name
+	}
+	return mailboxName, owner, nil
+}
+
+func findMailboxNameAndOwner(name, currentUser string) (mailboxName, owner string, err error) {
+	if strings.HasPrefix(name, namespaceSharedPrefix+constants.MailboxPathSeparator) {
+		owner = namespaceSharedPrefix
+		mailboxName = name[len(owner)+1:]
+	} else if strings.HasPrefix(name, namespaceOtherPrefix) {
+		parts := strings.SplitN(name, constants.MailboxPathSeparator, 3)
+		if len(parts) < 3 {
+			return "", "", errors.New("invalid access to " + namespaceOtherPrefix + " mailbox, need to follow format " + namespaceOtherPrefix + "/username/path")
+		}
+		owner = parts[1]
+		mailboxName = parts[2]
+	} else {
+		owner = currentUser
 		mailboxName = name
 	}
 	return mailboxName, owner, nil

@@ -3,6 +3,7 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
 	"github.com/patrick246/imap/backend/mongodb/constants"
@@ -25,14 +26,15 @@ type ImapMailbox struct {
 	username string
 	readonly bool
 
-	uids           []int
-	uidsLock       sync.RWMutex
-	listenerCancel context.CancelFunc
-	inserts        chan int
-	deletes        chan int
-	recents        chan int
-	recentsMap     map[uint32]struct{}
-	recentsMapLock sync.RWMutex
+	uids                []int
+	uidsLock            sync.RWMutex
+	listenerCancel      context.CancelFunc
+	inserts             chan int
+	deletes             chan int
+	recents             chan int
+	recentsMap          map[uint32]struct{}
+	recentsMapLock      sync.RWMutex
+	eventProcessingLock sync.Mutex
 
 	updateConn backend.Conn
 }
@@ -64,8 +66,9 @@ func NewMailbox(
 		deletes:  make(chan int, 1000),
 		recents:  make(chan int, 1000),
 
-		recentsMap:     make(map[uint32]struct{}),
-		recentsMapLock: sync.RWMutex{},
+		recentsMap:          make(map[uint32]struct{}),
+		recentsMapLock:      sync.RWMutex{},
+		eventProcessingLock: sync.Mutex{},
 
 		updateConn: conn,
 	}
@@ -103,7 +106,7 @@ func (i *ImapMailbox) Info() (*imap.MailboxInfo, error) {
 		name = namespaceOtherPrefix + constants.MailboxPathSeparator + mailbox.Owner + constants.MailboxPathSeparator + mailbox.Name
 	}
 
-	i.handleMailboxUpdateWithExpunge(0)
+	i.handleMailboxUpdateWithExpunge(0, 0)
 
 	return &imap.MailboxInfo{
 		Attributes: attributes,
@@ -202,6 +205,14 @@ func (i *ImapMailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.F
 		ch <- message
 	}
 
+	i.uidsLock.RLock()
+	messageCount := len(i.uids)
+	i.uidsLock.RUnlock()
+
+	if messageCount == 0 {
+		return errors.New("no messages in the mailbox")
+	}
+
 	for _, set := range seqset.Set {
 		if set.Start == 0 {
 			i.uidsLock.RLock()
@@ -239,8 +250,10 @@ func (i *ImapMailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.F
 				seqNum = si
 
 				i.uidsLock.RLock()
+				mailboxSize := uint32(len(i.uids))
 				if seqNum > uint32(len(i.uids)) {
-					return errors.New("seqnum bigger than mailbox")
+					i.uidsLock.RUnlock()
+					return errors.New(fmt.Sprintf("seqnum bigger than mailbox. size=%d", mailboxSize))
 				}
 				uidVal = uint32(i.uids[seqNum-1])
 				i.uidsLock.RUnlock()
@@ -252,7 +265,7 @@ func (i *ImapMailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.F
 	if !uid {
 		i.handleMailboxUpdatesNoExpunge()
 	} else {
-		i.handleMailboxUpdateWithExpunge(0)
+		i.handleMailboxUpdateWithExpunge(0, 0)
 	}
 
 	return nil
@@ -290,14 +303,98 @@ func (i *ImapMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria) ([
 	if !uid {
 		i.handleMailboxUpdatesNoExpunge()
 	} else {
-		i.handleMailboxUpdateWithExpunge(0)
+		i.handleMailboxUpdateWithExpunge(0, 0)
 	}
 
 	return uidResult, nil
 }
 
 func (i *ImapMailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error {
-	return errors.New("not implemented: Mailbox.CopyMessages")
+
+	name, owner, err := findMailboxNameAndOwner(dest, i.username)
+	if err != nil {
+		return err
+	}
+
+	destMailbox, err := i.mailboxRepo.FindByNameAndOwner(name, owner)
+	if err != nil {
+		return err
+	}
+
+	permissions := destMailbox.Permissions
+	permission, containsUser := permissions[i.username]
+	if !containsUser {
+		return backend.ErrNoSuchMailbox
+	}
+	if permission != repository.READWRITE {
+		return errors.New("destination mailbox is read only")
+	}
+
+	for _, seq := range seqset.Set {
+		if seq.Stop == 0 {
+			i.uidsLock.RLock()
+			if uid {
+				seq.Stop = uint32(i.uids[len(i.uids)-1])
+			} else {
+				seq.Stop = uint32(len(i.uids))
+			}
+			i.uidsLock.RUnlock()
+		}
+
+		if seq.Start == 0 {
+			i.uidsLock.RLock()
+			if uid {
+				seq.Start = uint32(i.uids[len(i.uids)-1])
+			} else {
+				seq.Start = uint32(len(i.uids))
+			}
+			i.uidsLock.RUnlock()
+		}
+
+		for mId := seq.Start; mId <= seq.Stop; mId++ {
+			var mUid uint32
+			if uid {
+				mUid = mId
+			} else {
+				i.uidsLock.RLock()
+				if int(mId) > len(i.uids) {
+					i.uidsLock.RUnlock()
+					continue
+				}
+
+				mUid = uint32(i.uids[mId-1])
+				i.uidsLock.RUnlock()
+			}
+
+			targetUid, err := i.mailboxRepo.AllocateUid(name, owner)
+			if err != nil {
+				log.Errorw(
+					"message copy allocate uid error",
+					"error", err,
+					"sourcemailbox", i.id,
+					"targetmailbox", destMailbox.Id,
+					"sourceuid", mUid,
+				)
+				continue
+			}
+
+			_, err = i.messageRepo.CopyMessage(i.id, mUid, destMailbox.Id, targetUid)
+			if err != nil {
+				log.Errorw(
+					"message copy error",
+					"error", err,
+					"sourcemailbox", i.id,
+					"targetmailbox", destMailbox.Id,
+					"sourceuid", mUid,
+					"targetuid", targetUid,
+				)
+				continue
+			}
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	return nil
 }
 
 func (i *ImapMailbox) Expunge() error {
@@ -310,13 +407,13 @@ func (i *ImapMailbox) Expunge() error {
 		return err
 	}
 
-	i.handleMailboxUpdateWithExpunge(n)
+	i.handleMailboxUpdateWithExpunge(n, 0)
 	return nil
 }
 
 func (i *ImapMailbox) Poll(expunge bool) error {
 	if expunge {
-		i.handleMailboxUpdateWithExpunge(0)
+		i.handleMailboxUpdateWithExpunge(0, 0)
 	} else {
 		i.handleMailboxUpdatesNoExpunge()
 	}
@@ -374,7 +471,7 @@ func (i *ImapMailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operati
 	if !uid {
 		i.handleMailboxUpdatesNoExpunge()
 	} else {
-		i.handleMailboxUpdateWithExpunge(0)
+		i.handleMailboxUpdateWithExpunge(0, 0)
 	}
 
 	return nil
@@ -414,6 +511,7 @@ func (i *ImapMailbox) setupDatabaseListener() {
 		for {
 			select {
 			case event := <-events:
+				log.Debugw("processing mailbox event", "type", event.OperationType, "event", event)
 				switch event.OperationType {
 				case repository.OpInsert:
 					i.processInsertEvent(&event)
@@ -485,26 +583,31 @@ func (i *ImapMailbox) handleMailboxUpdatesNoExpunge() {
 	}
 }
 
-func (i *ImapMailbox) handleMailboxUpdateWithExpunge(expectedNum int64) {
-	count := int64(0)
+func (i *ImapMailbox) handleMailboxUpdateWithExpunge(minExpunge, minInsert int64) {
+	countExpunge := int64(0)
+	countInsert := int64(0)
 	for {
 		select {
 		case uid := <-i.inserts:
+			log.Debugw("handling insert update", "mailbox", i.id, "uid", uid)
 			i.sendInsertUpdate(uid)
+			countInsert++
 
 		case _ = <-i.recents:
 			i.sendRecentUpdate()
 
 		case uid := <-i.deletes:
 			i.sendExpungeUpdate(uid)
+			countExpunge++
+
 		default:
-			if count < expectedNum {
+			if countExpunge < minExpunge || countInsert < minInsert {
 				time.Sleep(10 * time.Millisecond)
 			} else {
 				return
 			}
 		}
-		count++
+
 	}
 }
 

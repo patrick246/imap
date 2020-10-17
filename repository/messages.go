@@ -287,7 +287,7 @@ func (repo *MessageRepository) WatchMailbox(ctx context.Context, mailboxId strin
 					log.Errorw("mailbox subscription decode error", "error", err)
 					continue
 				}
-
+				log.Debugw("database event content", "id", mailboxId, "event", event)
 				eventChannel <- event
 				continue
 			}
@@ -614,6 +614,52 @@ func (repo *MessageRepository) ExpungeMailbox(mailboxId string) (int64, error) {
 
 	log.Debugw("expunge result", "mailboxId", mailboxId, "count", result.DeletedCount)
 	return result.DeletedCount, nil
+}
+
+func (repo *MessageRepository) CopyMessage(mailboxSource string, uid uint32, mailboxTarget string, targetUid uint32) (uint32, error) {
+	query := bson.D{{
+		"mailboxId", mailboxSource,
+	}, {
+		"uid", uid,
+	}}
+
+	result := repo.conn.Collection(messageCollection).FindOne(context.Background(), query)
+
+	var message Message
+	err := result.Decode(&message)
+	if err != nil {
+		return 0, err
+	}
+
+	message.MailboxId = mailboxTarget
+	message.Uid = targetUid
+	message.ID = fmt.Sprintf("%s-%d", mailboxTarget, targetUid)
+	message.Recent = true
+
+	ds, err := repo.messageBucket.OpenDownloadStreamByName(fmt.Sprintf("%s-%d", mailboxSource, uid))
+	if err != nil {
+		return 0, err
+	}
+	defer ds.Close()
+
+	us, err := repo.messageBucket.OpenUploadStream(fmt.Sprintf("%s-%d", mailboxTarget, targetUid))
+	if err != nil {
+		return 0, err
+	}
+	defer us.Close()
+
+	_, err = io.Copy(us, ds)
+	if err != nil {
+		return 0, err
+	}
+
+	// only insert after copy is done, so the change stream only fires when the copy is complete
+	_, err = repo.conn.Collection(messageCollection).InsertOne(context.Background(), message)
+	if err != nil {
+		return 0, err
+	}
+
+	return targetUid, nil
 }
 
 func mapSearchCriteriaToQuery(criteria *imap.SearchCriteria, uids []uint32, mailboxId string, depth int, invert bool) (bson.D, error) {
