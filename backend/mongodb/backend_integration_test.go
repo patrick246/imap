@@ -23,7 +23,7 @@ type BackendIntegrationStub struct {
 func (b *BackendIntegrationStub) GetUser(username string) (backend.User, error) {
 	userinfo := ldap.UserInfo{
 		Username: username,
-		Mail:     fmt.Sprintf("%s@example.com", username),
+		Mail:     []string{fmt.Sprintf("%s@example.com", username)},
 	}
 	user := NewUser(b.userRepo, b.mailboxRepo, b.messageRepo, &userinfo)
 	return user, nil
@@ -32,7 +32,7 @@ func (b *BackendIntegrationStub) GetUser(username string) (backend.User, error) 
 func (b *BackendIntegrationStub) CreateUser(username string) error {
 	userinfo := ldap.UserInfo{
 		Username: username,
-		Mail:     fmt.Sprintf("%s@example.com", username),
+		Mail:     []string{fmt.Sprintf("%s@example.com", username)},
 	}
 	_, err := b.userRepo.ProvisionUserFromUserInfo(&userinfo, b.mailboxRepo)
 	return err

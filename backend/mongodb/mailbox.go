@@ -209,7 +209,7 @@ func (i *ImapMailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.F
 	messageCount := len(i.uids)
 	i.uidsLock.RUnlock()
 
-	if messageCount == 0 {
+	if messageCount == 0 && !uid {
 		return errors.New("no messages in the mailbox")
 	}
 

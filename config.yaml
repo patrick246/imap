@@ -16,6 +16,11 @@ server:
     allowInsecureAuth: false
   imaps:
     address: :1993
+  lmtp:
+    address: :1124
+    network: tcp
+  lmtps:
+    address: :1224
 
 ldap:
   hostname: ""

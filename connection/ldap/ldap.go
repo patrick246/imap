@@ -29,7 +29,7 @@ type Connection struct {
 
 type UserInfo struct {
 	Username string
-	Mail     string
+	Mail     []string
 }
 
 func Connect(info ConnectionInfo) (*Connection, error) {
@@ -126,12 +126,12 @@ func (conn *Connection) FindUser(username string) (*UserInfo, error) {
 		return nil, errors.New("could not find user")
 	}
 
-	if len(response.Entries[0].Attributes[0].Values) != 1 {
-		return nil, errors.New("user no or more than one mail attribute")
+	if len(response.Entries[0].Attributes[0].Values) < 1 {
+		return nil, errors.New("user has no mail attribute")
 	}
 
 	return &UserInfo{
 		Username: username,
-		Mail:     response.Entries[0].Attributes[0].Values[0],
+		Mail:     response.Entries[0].Attributes[0].Values,
 	}, nil
 }

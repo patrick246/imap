@@ -4,12 +4,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"github.com/emersion/go-imap/server"
+	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/go-imap-namespace"
 	"github.com/patrick246/imap/backend/mongodb"
 	"github.com/patrick246/imap/certificatehandler"
 	"github.com/patrick246/imap/config"
 	"github.com/patrick246/imap/connection/ldap"
 	"github.com/patrick246/imap/connection/mongodbConnection"
+	"github.com/patrick246/imap/lmtp"
 	"github.com/patrick246/imap/observability/logging"
 	"github.com/patrick246/imap/repository"
 	"github.com/spf13/viper"
@@ -55,7 +57,7 @@ func main() {
 		log.Fatalw("message repository setup error", "error", err)
 	}
 
-	tlsConfig, err := buildTlsConfig()
+	tlsConfig, err := buildTlsConfig("imaps")
 	if err != nil {
 		log.Fatalw("error building tls config", "error", err)
 	}
@@ -82,6 +84,46 @@ func main() {
 		imapServer.Addr = config.GetString("server.imaps.address", ":1993")
 		log.Infow("starting imaps server", "address", imapServer.Addr)
 		if err := imapServer.ListenAndServeTLS(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	lmtpTlsConfig, err := buildTlsConfig("lmtps")
+	if err != nil {
+		log.Fatalw("error building tls config", "server", "lmtps", "error", err)
+	}
+
+	var lmtpConfig lmtp.Config
+	err = viper.UnmarshalKey("server.lmtp", &lmtpConfig)
+	if err != nil {
+		log.Fatalw("error getting lmtp config", "server", "lmtp", "error", err)
+	}
+
+	lmtpBackend, err := lmtp.NewBackend(lmtpConfig, ldapConn, mailboxRepo, messageRepo, userRepo)
+	if err != nil {
+		log.Fatalw("error creating lmtp backend", "server", "lmtp", "error", err)
+	}
+
+	lmtpServer := smtp.NewServer(lmtpBackend)
+	lmtpServer.LMTP = true
+	lmtpServer.AuthDisabled = true
+	lmtpServer.TLSConfig = lmtpTlsConfig
+	lmtpServer.Debug = os.Stderr
+	lmtpServer.ErrorLog = logging.ImapAdapter{Logger: logging.CreateLogger("go-smtp")}
+
+	go func() {
+		lmtpServer.Addr = config.GetString("server.lmtp.address", ":24")
+		lmtpServer.Network = config.GetString("server.lmtp.network", "tcp")
+		log.Infow("starting lmtp server", "address", lmtpServer.Addr)
+		if err := lmtpServer.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	go func() {
+		lmtpServer.Addr = config.GetString("server.lmtps.address", ":2424")
+		log.Infow("starting lmtps server", "address", lmtpServer.Addr)
+		if err := lmtpServer.ListenAndServeTLS(); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -113,7 +155,7 @@ func connectToLdap() (*ldap.Connection, error) {
 	return ldap.Connect(ldapConnInfo)
 }
 
-func buildTlsConfig() (*tls.Config, error) {
+func buildTlsConfig(server string) (*tls.Config, error) {
 	cipherSuiteMap := make(map[string]uint16)
 
 	for _, suite := range tls.CipherSuites() {
@@ -128,8 +170,8 @@ func buildTlsConfig() (*tls.Config, error) {
 	}
 
 	loader, err := certificatehandler.New(
-		config.GetString("server.tls.certificate", "tls/tls.crt"),
-		config.GetString("server.tls.key", "tls/tls.key"),
+		config.GetString("server."+server+".tls.certificate", config.GetString("server.tls.certificate", "tls/tls.crt")),
+		config.GetString("server."+server+".tls.key", config.GetString("server.tls.key", "tls/tls.key")),
 	)
 	if err != nil {
 		return nil, err

@@ -229,8 +229,13 @@ func (repo *MailboxRepository) AllocateUid(name, owner string) (uint32, error) {
 }
 
 func (repo *MailboxRepository) AllocateUidById(mailboxId string) (uint32, error) {
+	mailboxObjectId, err := primitive.ObjectIDFromHex(mailboxId)
+	if err != nil {
+		return 0, err
+	}
+
 	mailboxQuery := bson.D{{
-		"_id", mailboxId,
+		"_id", mailboxObjectId,
 	}}
 
 	update := bson.D{{
@@ -247,7 +252,7 @@ func (repo *MailboxRepository) AllocateUidById(mailboxId string) (uint32, error)
 	result := repo.conn.Collection(mailboxCollection).FindOneAndUpdate(context.Background(), mailboxQuery, update, updateOptions)
 
 	var mailbox Mailbox
-	err := result.Decode(&mailbox)
+	err = result.Decode(&mailbox)
 	return mailbox.NextUid, err
 }
 
